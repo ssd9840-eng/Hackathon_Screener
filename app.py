@@ -78,11 +78,13 @@ MEMBER_REQUIRED_FIELDS = [
     "Skill Set",
     "Resume Link",
 ]
+# Present per member and used for fetching, but an empty value never triggers a hard
+# eligibility flag (matches the spec: portfolio issues are softer than resume issues).
+MEMBER_SOFT_FIELDS = ["Portfolio or Case Study Link"]
 MEMBER_OPTIONAL_FIELDS = ["LinkedIn or GitHub"]
 
 BASE_REQUIRED_COLUMNS = ["Team Name", "Captain Full Name", "Captain Email"]
 OTHER_REQUIRED_COLUMNS = [
-    "Portfolio or Case Study Link",
     "All 5 members can attend the full event",
     "AI-assisted review consent",
 ]
@@ -105,7 +107,7 @@ def member_field(i, field):
 def build_required_columns():
     cols = list(BASE_REQUIRED_COLUMNS)
     for i in range(1, 6):
-        for f in MEMBER_REQUIRED_FIELDS:
+        for f in MEMBER_REQUIRED_FIELDS + MEMBER_SOFT_FIELDS:
             cols.append(member_field(i, f))
     cols += OTHER_REQUIRED_COLUMNS
     return cols
@@ -447,7 +449,7 @@ def fetch_portfolio(url, cache):
 # Stage 3: AI scoring
 # ---------------------------------------------------------------------------
 
-def build_prompt(q_answers, resumes_by_member, portfolio_text):
+def build_prompt(q_answers, resumes_by_member, portfolios_by_member):
     lines = [
         "You are helping a hackathon review panel score a team application against a fixed rubric. "
         "Score only what is provided. Do not try to guess anyone's identity. Respond with JSON only, "
@@ -455,8 +457,8 @@ def build_prompt(q_answers, resumes_by_member, portfolio_text):
         "",
         "Rubric:",
         "- technical_capability (0-25): from resumes only",
-        "- portfolio_quality (0-25): depth, clarity, evidence of real work. No-code and business case "
-        "studies count equally with code.",
+        "- portfolio_quality (0-25): depth, clarity, evidence of real work across the members' individual "
+        "portfolio/case study links. No-code and business case studies count equally with code.",
         "- problem_thinking (0-20): specificity in the team's answers below, real users and problems, "
         "not buzzwords or filler",
         "- execution_track_record (0-15): shipped projects, past hackathons, internships. Reward "
@@ -474,8 +476,10 @@ def build_prompt(q_answers, resumes_by_member, portfolio_text):
         lines.append(f"--- {label} ---\n{snippet}")
 
     lines.append("")
-    lines.append("Portfolio / case study:")
-    lines.append((portfolio_text or "(not available)")[:PORTFOLIO_TRUNCATE_CHARS])
+    lines.append("Member portfolios / case studies:")
+    for label, text in portfolios_by_member:
+        snippet = text[:PORTFOLIO_TRUNCATE_CHARS] if text else "(portfolio not available)"
+        lines.append(f"--- {label} ---\n{snippet}")
 
     lines.append("")
     lines.append(
@@ -629,10 +633,18 @@ def run_pipeline(df, client, progress_callback=None):
             else:
                 resumes_by_member.append((label, redact(res["text"], redact_values)))
 
-        portfolio_link = get_val(row, "Portfolio or Case Study Link")
-        portfolio_res = fetch_portfolio(portfolio_link, link_cache)
-        needs_manual_review = portfolio_res["status"] != "ok"
-        portfolio_text = redact(portfolio_res.get("text", ""), redact_values)
+        portfolios_by_member = []
+        portfolio_review_notes = []
+        for i in range(1, 6):
+            link = get_val(row, member_field(i, "Portfolio or Case Study Link"))
+            skill = get_val(row, member_field(i, "Skill Set"))
+            res = fetch_portfolio(link, link_cache)
+            label = f"Member {i} ({skill or 'Unknown role'})"
+            if res["status"] != "ok":
+                portfolio_review_notes.append(f"Member {i}: {res.get('note', '')}")
+            portfolios_by_member.append((label, redact(res.get("text", ""), redact_values)))
+        needs_manual_review = bool(portfolio_review_notes)
+        portfolio_note = "; ".join(portfolio_review_notes)
 
         base_record = {
             "Team Name": team,
@@ -650,7 +662,7 @@ def run_pipeline(df, client, progress_callback=None):
                 label = col if col else prefix
                 q_answers.append((label, redact(ans, redact_values)))
 
-            prompt = build_prompt(q_answers, resumes_by_member, portfolio_text)
+            prompt = build_prompt(q_answers, resumes_by_member, portfolios_by_member)
             outcome = score_team_with_ai(client, prompt, score_cache)
 
             if "error" in outcome:
@@ -669,7 +681,7 @@ def run_pipeline(df, client, progress_callback=None):
                     "Composition Reason": comp_reason,
                     "Total": total_score,
                     "Needs Manual Review": needs_manual_review,
-                    "Portfolio Note": portfolio_res.get("note", ""),
+                    "Portfolio Note": portfolio_note,
                 })
 
         if progress_callback:
