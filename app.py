@@ -16,6 +16,7 @@ import time
 from collections import Counter
 from urllib.parse import urlparse
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -68,6 +69,20 @@ SCORE_LABELS = {
     "portfolio_quality": "Portfolio Quality",
     "problem_thinking": "Problem Thinking",
     "execution_track_record": "Execution Track Record",
+}
+# Fixed categorical order (Okabe-Ito, colorblind-safe), one hue per rubric category.
+CRITERION_COLORS = {
+    "Technical Capability": "#0072B2",
+    "Portfolio Quality": "#009E73",
+    "Problem Thinking": "#E69F00",
+    "Execution Track Record": "#CC79A7",
+    "Composition": "#56B4E9",
+}
+# Reserved status colors — meaning fixed across the app, never reused for anything else.
+BUCKET_STATUS_COLORS = {
+    "Top 30": "#1a7f37",
+    "Waitlist": "#b45309",
+    "": "#6b7280",
 }
 
 MEMBER_REQUIRED_FIELDS = [
@@ -505,7 +520,7 @@ def try_parse_scores(raw):
         out = {}
         for key, mx in SCORE_MAXES.items():
             entry = data[key]
-            score = float(entry["score"])
+            score = round(float(entry["score"]))
             score = max(0, min(mx, score))
             out[key] = {"score": score, "reason": str(entry.get("reason", ""))}
         return out
@@ -646,10 +661,13 @@ def run_pipeline(df, client, progress_callback=None):
         needs_manual_review = bool(portfolio_review_notes)
         portfolio_note = "; ".join(portfolio_review_notes)
 
+        member_skills = [get_val(row, member_field(i, "Skill Set")) for i in range(1, 6)]
         base_record = {
             "Team Name": team,
             "Captain Email": captain_email,
             "Member Emails": member_emails,
+            "Member Names": member_names,
+            "Member Skills": member_skills,
         }
 
         if reasons:
@@ -669,8 +687,7 @@ def run_pipeline(df, client, progress_callback=None):
                 errored.append({**base_record, "Error": outcome["error"]})
             else:
                 ai_scores = outcome["result"]
-                skill_values = [get_val(row, member_field(i, "Skill Set")) for i in range(1, 6)]
-                comp_score, comp_reason = composition_score(skill_values)
+                comp_score, comp_reason = composition_score(member_skills)
                 ai_total = sum(v["score"] for v in ai_scores.values())
                 total_score = ai_total + comp_score
 
@@ -708,48 +725,94 @@ def run_pipeline(df, client, progress_callback=None):
 # UI
 # ---------------------------------------------------------------------------
 
-BUCKET_COLORS = {
-    "Top 30": "#e8f5e9",
-    "Waitlist": "#fff8e1",
-}
-REVIEW_BAND_BORDER = "border-left: 4px solid #f59e0b"
-
-
-def render_results_table(scored):
+def render_leaderboard_table(scored):
+    """A compact, few-column table for quick scanning — no horizontal scroll."""
     rows = []
     for rec in scored:
-        row = {
+        rows.append({
             "Rank": rec["Rank"],
-            "Bucket": rec["Bucket"],
+            "Bucket": rec["Bucket"] or "—",
             "Team Name": rec["Team Name"],
-            "Captain Email": rec["Captain Email"],
-        }
-        for key, label in SCORE_LABELS.items():
-            row[label] = rec["AI Scores"][key]["score"]
-        row["Composition"] = rec["Composition Score"]
-        row["Total (/100)"] = rec["Total"]
-        flags = []
-        if rec["Needs Manual Review"]:
-            flags.append("needs manual review (portfolio)")
-        if rec["Manual Review Band"]:
-            flags.append("borderline — review by hand")
-        row["Notes"] = "; ".join(flags)
-        row["_review_band"] = rec["Manual Review Band"]
-        rows.append(row)
+            "Total (/100)": rec["Total"],
+        })
     return pd.DataFrame(rows)
 
 
-def style_ranked_table(df):
+def style_leaderboard_table(df, review_flags):
     def row_style(row):
-        bg = BUCKET_COLORS.get(row["Bucket"], "")
-        border = REVIEW_BAND_BORDER if row["_review_band"] else ""
-        combined = "; ".join(s for s in [bg and f"background-color: {bg}", border] if s)
+        bucket = row["Bucket"]
+        bg_style = f"background-color: {BUCKET_STATUS_COLORS[bucket]}1a" if bucket in ("Top 30", "Waitlist") else ""
+        border = "border-left: 4px solid #f59e0b" if review_flags[row.name] else ""
+        combined = "; ".join(s for s in [bg_style, border] if s)
         return [combined] * len(row)
 
     styled = df.style.apply(row_style, axis=1)
-    styled = styled.hide(axis="columns", subset=["_review_band"])
     styled = styled.hide(axis="index")
     return styled
+
+
+def build_overview_chart(scored):
+    """Horizontal leaderboard bar chart, sorted by rank, colored by bucket status."""
+    rows = []
+    for rec in scored:
+        rows.append({
+            "Team": f"#{rec['Rank']} {rec['Team Name']}",
+            "Total": rec["Total"],
+            "Bucket": rec["Bucket"] or "Other",
+            "Rank": rec["Rank"],
+        })
+    df = pd.DataFrame(rows)
+
+    color_scale = alt.Scale(
+        domain=["Top 30", "Waitlist", "Other"],
+        range=[BUCKET_STATUS_COLORS["Top 30"], BUCKET_STATUS_COLORS["Waitlist"], BUCKET_STATUS_COLORS[""]],
+    )
+    chart = (
+        alt.Chart(df)
+        .mark_bar(cornerRadiusEnd=3)
+        .encode(
+            y=alt.Y("Team:N", sort=alt.SortField(field="Rank", order="ascending"), title=None),
+            x=alt.X("Total:Q", title="Total score (/100)", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Bucket:N", scale=color_scale, legend=alt.Legend(title="Bucket")),
+            tooltip=["Team", "Total", "Bucket"],
+        )
+        .properties(height=max(28 * len(rows), 120))
+    )
+    labels = chart.mark_text(align="left", dx=4, color="#111827").encode(text="Total:Q")
+    return chart + labels
+
+
+def build_criteria_chart(rec):
+    """Small horizontal stacked bar showing how one team's total breaks down by criterion."""
+    rows = [{"Criterion": label, "Score": rec["AI Scores"][key]["score"], "Max": SCORE_MAXES[key]}
+            for key, label in SCORE_LABELS.items()]
+    rows.append({"Criterion": "Composition", "Score": rec["Composition Score"], "Max": 15})
+    df = pd.DataFrame(rows)
+    order = list(CRITERION_COLORS.keys())
+    color_scale = alt.Scale(domain=order, range=[CRITERION_COLORS[c] for c in order])
+    chart = (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Score:Q", stack="zero", title=None, axis=None, scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Criterion:N", scale=color_scale, sort=order, legend=None),
+            order=alt.Order("Criterion:N", sort="ascending"),
+            tooltip=["Criterion", "Score", "Max"],
+        )
+        .properties(height=28)
+    )
+    return chart
+
+
+def summarize_team(rec):
+    """One auto-generated line: strongest and weakest rubric category, by share of max."""
+    parts = [(SCORE_LABELS[k], rec["AI Scores"][k]["score"], SCORE_MAXES[k]) for k in SCORE_LABELS]
+    parts.append(("Composition", rec["Composition Score"], 15))
+    ratios = [(name, score, mx, score / mx if mx else 0) for name, score, mx in parts]
+    strongest = max(ratios, key=lambda t: t[3])
+    weakest = min(ratios, key=lambda t: t[3])
+    return (f"Strongest: {strongest[0]} ({strongest[1]}/{strongest[2]}) · "
+            f"Needs a look: {weakest[0]} ({weakest[1]}/{weakest[2]})")
 
 
 def build_download_csv(scored, flagged, errored):
@@ -806,17 +869,113 @@ def build_download_csv(scored, flagged, errored):
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
 
 
+WALKTHROUGH_SLIDES = [
+    {
+        "icon": "👋",
+        "title": "Welcome, reviewer",
+        "body": (
+            "This tool does the first, most repetitive pass of screening hackathon team "
+            "applications so your panel can spend its time on the interesting calls — the "
+            "borderline teams.\n\n"
+            "It checks eligibility rules, reads resumes and portfolio links, scores every "
+            "eligible team against the panel's 100-point rubric with names and emails "
+            "blacked out, and ranks them into Top 30 / Waitlist. A human — you — still makes "
+            "every final decision."
+        ),
+    },
+    {
+        "icon": "📤",
+        "title": "Step 1 — Upload your roster",
+        "body": (
+            "In the **sidebar** on the left:\n\n"
+            "- **API key status** — a small green/red dot tells you whether the tool can "
+            "reach Claude. If it's red, screening won't run until that's fixed.\n"
+            "- **Upload team roster** — drop in the `.csv` or `.xlsx` export from your Google "
+            "Form (one row per team).\n"
+            "- **Top 30 teams email export** — this only controls how many teams' emails "
+            "get bundled at the bottom for Luma invites later. It doesn't affect scoring."
+        ),
+    },
+    {
+        "icon": "⚙️",
+        "title": "Step 2 — Run screening",
+        "body": (
+            "Click **Run screening**. A progress bar shows the tool working through each "
+            "team: checking eligibility, reading links, then scoring with Claude.\n\n"
+            "For ~120 teams, expect this to take a few minutes — most of the time goes to "
+            "reading resumes/portfolios and the AI scoring calls, not the eligibility checks."
+        ),
+    },
+    {
+        "icon": "📊",
+        "title": "Step 3 — Read your results",
+        "body": (
+            "Results appear in three tabs:\n\n"
+            "- **🏆 Ranked** — every team that passed eligibility, as a leaderboard chart "
+            "plus one card per team (score breakdown, strongest/weakest area, full reasoning "
+            "on click).\n"
+            "- **🚩 Flagged** — teams that broke a rule (bad email domain, missing field, "
+            "etc.), with the exact reason. These are never scored.\n"
+            "- **⚠️ Errors** — eligible teams Claude couldn't score (e.g. an API hiccup) — "
+            "never a fake score, always the real error message.\n\n"
+            "Colors mean the same thing everywhere: **green = Top 30, amber = Waitlist, "
+            "orange border = borderline (ranks 25–40) — the band your funnel doc says a "
+            "human should read personally.**\n\n"
+            "At the bottom: a CSV download of everything, and the Luma email-paste box."
+        ),
+    },
+]
+
+
+def render_walkthrough():
+    if "onboarding_step" not in st.session_state:
+        st.session_state.onboarding_step = 0
+    step = st.session_state.onboarding_step
+    slide = WALKTHROUGH_SLIDES[step]
+    total = len(WALKTHROUGH_SLIDES)
+
+    with st.container(border=True):
+        st.markdown(f"## {slide['icon']} {slide['title']}")
+        st.markdown(slide["body"])
+        st.progress((step + 1) / total, text=f"Step {step + 1} of {total}")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        if step > 0:
+            if c1.button("← Back"):
+                st.session_state.onboarding_step -= 1
+                st.rerun()
+        if step < total - 1:
+            if c2.button("Next →", type="primary"):
+                st.session_state.onboarding_step += 1
+                st.rerun()
+        else:
+            if c2.button("Get started →", type="primary"):
+                st.session_state.onboarded = True
+                st.rerun()
+        if c3.button("Skip walkthrough"):
+            st.session_state.onboarded = True
+            st.rerun()
+
+
 def main():
     st.title("Hackathon Team Screener")
+
+    if not st.session_state.get("onboarded"):
+        render_walkthrough()
+        return
 
     client, api_key = get_api_client()
 
     with st.sidebar:
         st.header("Setup")
+        if st.button("❓ How this works"):
+            st.session_state.onboarded = False
+            st.session_state.onboarding_step = 0
+            st.rerun()
+
         if api_key and client is not None:
-            st.success("API key loaded ✓")
+            st.caption("🟢 API key loaded")
         else:
-            st.error("API key not found")
+            st.caption("🔴 API key not found")
             st.caption("Set ANTHROPIC_API_KEY in Streamlit secrets or your environment.")
 
         uploaded_file = st.file_uploader("Upload team roster (.csv or .xlsx)", type=["csv", "xlsx"])
@@ -867,12 +1026,15 @@ def main():
     flagged = results["flagged"]
     errored = results["errored"]
 
-    st.subheader("Summary")
-    cols = st.columns(4)
-    cols[0].metric("Total teams", total_teams)
-    cols[1].metric("Eligible", len(scored) + len(errored))
-    cols[2].metric("Flagged", len(flagged))
-    cols[3].metric("Scored", len(scored))
+    with st.container(border=True):
+        st.subheader("Overview")
+        cols = st.columns(4)
+        cols[0].metric("Total teams", total_teams)
+        cols[1].metric("Eligible", len(scored) + len(errored))
+        cols[2].metric("Flagged", len(flagged))
+        cols[3].metric("Scored", len(scored))
+        if scored:
+            st.altair_chart(build_overview_chart(scored), width='stretch')
 
     if errored:
         st.warning(f"{len(errored)} eligible team(s) could not be scored due to API errors — see the Errors tab.")
@@ -887,22 +1049,41 @@ def main():
         if scored:
             st.caption("🟩 Top 30 · 🟨 Waitlist (31–35) · orange left-border = borderline "
                        "(ranks 25–40) — review by hand")
-            table_df = render_results_table(scored)
-            st.dataframe(style_ranked_table(table_df), use_container_width=True)
+            leaderboard_df = render_leaderboard_table(scored)
+            review_flags = [rec["Manual Review Band"] for rec in scored]
+            st.dataframe(style_leaderboard_table(leaderboard_df, review_flags), width='stretch')
 
-            team_names = [f"#{r['Rank']} — {r['Team Name']}" for r in scored]
-            pick = st.selectbox("View score reasoning for a team", ["(select a team)"] + team_names)
-            if pick != "(select a team)":
-                rec = scored[team_names.index(pick)]
-                with st.expander(f"Score details — {rec['Team Name']}", expanded=True):
-                    for key, label in SCORE_LABELS.items():
-                        entry = rec["AI Scores"][key]
-                        st.markdown(f"**{label}: {entry['score']}/{SCORE_MAXES[key]}**")
-                        st.write(entry["reason"])
-                    st.markdown(f"**Composition: {rec['Composition Score']}/15**")
-                    st.write(rec["Composition Reason"])
+            st.divider()
+            for rec in scored:
+                with st.container(border=True):
+                    header_cols = st.columns([5, 2, 2])
+                    header_cols[0].markdown(f"**#{rec['Rank']} — {rec['Team Name']}**")
+                    if rec["Bucket"]:
+                        header_cols[1].markdown(f":green[{rec['Bucket']}]" if rec["Bucket"] == "Top 30"
+                                                 else f":orange[{rec['Bucket']}]")
+                    header_cols[2].markdown(f"**{rec['Total']}/100**")
+
+                    members_line = " · ".join(
+                        f"{name} ({skill})" if name else ""
+                        for name, skill in zip(rec["Member Names"], rec["Member Skills"])
+                        if name
+                    )
+                    st.caption(members_line)
+
+                    st.altair_chart(build_criteria_chart(rec), width='stretch')
+                    st.caption(summarize_team(rec))
+                    if rec["Manual Review Band"]:
+                        st.caption("🟠 Borderline — ranks 25–40, review by hand")
                     if rec["Needs Manual Review"]:
-                        st.info(f"Portfolio flagged for manual review: {rec['Portfolio Note']}")
+                        st.caption(f"ℹ️ Portfolio needs manual review: {rec['Portfolio Note']}")
+
+                    with st.expander("Full score reasoning"):
+                        for key, label in SCORE_LABELS.items():
+                            entry = rec["AI Scores"][key]
+                            st.markdown(f"**{label}: {entry['score']}/{SCORE_MAXES[key]}**")
+                            st.write(entry["reason"])
+                        st.markdown(f"**Composition: {rec['Composition Score']}/15**")
+                        st.write(rec["Composition Reason"])
         else:
             st.write("No teams were scored.")
 
@@ -910,14 +1091,14 @@ def main():
         if flagged:
             flagged_rows = [{"Team Name": r["Team Name"], "Captain Email": r["Captain Email"],
                               "Reasons": "; ".join(r["Reasons"])} for r in flagged]
-            st.dataframe(pd.DataFrame(flagged_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(flagged_rows), width='stretch', hide_index=True)
         else:
             st.write("No teams were flagged.")
 
     with tab_errors:
         if errored:
             st.dataframe(pd.DataFrame(errored)[["Team Name", "Captain Email", "Error"]],
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
         else:
             st.write("No scoring errors.")
 
