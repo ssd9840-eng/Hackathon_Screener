@@ -799,7 +799,8 @@ def main():
             st.caption("Set ANTHROPIC_API_KEY in Streamlit secrets or your environment.")
 
         uploaded_file = st.file_uploader("Upload team roster (.csv or .xlsx)", type=["csv", "xlsx"])
-        top_n = st.number_input("Top N (for Luma email export)", min_value=1, max_value=500, value=30, step=1)
+        top_n = st.number_input("Top 30 teams email export", min_value=1, max_value=500, value=30, step=1)
+        st.caption(f"Will bundle the member emails of the top {top_n} scored teams below, for pasting into Luma.")
         run_clicked = st.button("Run screening", type="primary", disabled=(uploaded_file is None or client is None))
 
     if run_clicked and uploaded_file is not None:
