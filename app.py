@@ -708,6 +708,13 @@ def run_pipeline(df, client, progress_callback=None):
 # UI
 # ---------------------------------------------------------------------------
 
+BUCKET_COLORS = {
+    "Top 30": "#e8f5e9",
+    "Waitlist": "#fff8e1",
+}
+REVIEW_BAND_BORDER = "border-left: 4px solid #f59e0b"
+
+
 def render_results_table(scored):
     rows = []
     for rec in scored:
@@ -727,8 +734,22 @@ def render_results_table(scored):
         if rec["Manual Review Band"]:
             flags.append("borderline — review by hand")
         row["Notes"] = "; ".join(flags)
+        row["_review_band"] = rec["Manual Review Band"]
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def style_ranked_table(df):
+    def row_style(row):
+        bg = BUCKET_COLORS.get(row["Bucket"], "")
+        border = REVIEW_BAND_BORDER if row["_review_band"] else ""
+        combined = "; ".join(s for s in [bg and f"background-color: {bg}", border] if s)
+        return [combined] * len(row)
+
+    styled = df.style.apply(row_style, axis=1)
+    styled = styled.hide(axis="columns", subset=["_review_band"])
+    styled = styled.hide(axis="index")
+    return styled
 
 
 def build_download_csv(scored, flagged, errored):
@@ -854,37 +875,51 @@ def main():
     cols[3].metric("Scored", len(scored))
 
     if errored:
-        st.warning(f"{len(errored)} eligible team(s) could not be scored due to API errors:")
-        st.dataframe(pd.DataFrame(errored)[["Team Name", "Captain Email", "Error"]], use_container_width=True)
+        st.warning(f"{len(errored)} eligible team(s) could not be scored due to API errors — see the Errors tab.")
 
-    st.subheader("Ranked teams")
-    if scored:
-        table_df = render_results_table(scored)
-        st.dataframe(table_df, use_container_width=True, hide_index=True)
+    tab_ranked, tab_flagged, tab_errors = st.tabs([
+        f"🏆 Ranked ({len(scored)})",
+        f"🚩 Flagged ({len(flagged)})",
+        f"⚠️ Errors ({len(errored)})",
+    ])
 
-        team_names = [f"#{r['Rank']} — {r['Team Name']}" for r in scored]
-        pick = st.selectbox("View score reasoning for a team", ["(select a team)"] + team_names)
-        if pick != "(select a team)":
-            rec = scored[team_names.index(pick)]
-            with st.expander(f"Score details — {rec['Team Name']}", expanded=True):
-                for key, label in SCORE_LABELS.items():
-                    entry = rec["AI Scores"][key]
-                    st.markdown(f"**{label}: {entry['score']}/{SCORE_MAXES[key]}**")
-                    st.write(entry["reason"])
-                st.markdown(f"**Composition: {rec['Composition Score']}/15**")
-                st.write(rec["Composition Reason"])
-                if rec["Needs Manual Review"]:
-                    st.info(f"Portfolio flagged for manual review: {rec['Portfolio Note']}")
-    else:
-        st.write("No teams were scored.")
+    with tab_ranked:
+        if scored:
+            st.caption("🟩 Top 30 · 🟨 Waitlist (31–35) · orange left-border = borderline "
+                       "(ranks 25–40) — review by hand")
+            table_df = render_results_table(scored)
+            st.dataframe(style_ranked_table(table_df), use_container_width=True)
 
-    st.subheader("Flagged teams (not scored)")
-    if flagged:
-        flagged_rows = [{"Team Name": r["Team Name"], "Captain Email": r["Captain Email"],
-                          "Reasons": "; ".join(r["Reasons"])} for r in flagged]
-        st.dataframe(pd.DataFrame(flagged_rows), use_container_width=True, hide_index=True)
-    else:
-        st.write("No teams were flagged.")
+            team_names = [f"#{r['Rank']} — {r['Team Name']}" for r in scored]
+            pick = st.selectbox("View score reasoning for a team", ["(select a team)"] + team_names)
+            if pick != "(select a team)":
+                rec = scored[team_names.index(pick)]
+                with st.expander(f"Score details — {rec['Team Name']}", expanded=True):
+                    for key, label in SCORE_LABELS.items():
+                        entry = rec["AI Scores"][key]
+                        st.markdown(f"**{label}: {entry['score']}/{SCORE_MAXES[key]}**")
+                        st.write(entry["reason"])
+                    st.markdown(f"**Composition: {rec['Composition Score']}/15**")
+                    st.write(rec["Composition Reason"])
+                    if rec["Needs Manual Review"]:
+                        st.info(f"Portfolio flagged for manual review: {rec['Portfolio Note']}")
+        else:
+            st.write("No teams were scored.")
+
+    with tab_flagged:
+        if flagged:
+            flagged_rows = [{"Team Name": r["Team Name"], "Captain Email": r["Captain Email"],
+                              "Reasons": "; ".join(r["Reasons"])} for r in flagged]
+            st.dataframe(pd.DataFrame(flagged_rows), use_container_width=True, hide_index=True)
+        else:
+            st.write("No teams were flagged.")
+
+    with tab_errors:
+        if errored:
+            st.dataframe(pd.DataFrame(errored)[["Team Name", "Captain Email", "Error"]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.write("No scoring errors.")
 
     st.subheader("Export")
     csv_bytes = build_download_csv(scored, flagged, errored)
